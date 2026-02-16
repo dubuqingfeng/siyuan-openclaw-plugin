@@ -55,12 +55,15 @@ pnpm install
 
 ## Configuration
 
-Create one of the following config files (first match wins):
+The plugin loads config in this precedence order:
 
-- `./openclaw.config.json` (recommended for project-local config)
-- `./openclaw.json`
-- `~/.openclaw/openclaw.config.json`
-- `~/.openclaw/openclaw.json` (legacy default)
+- **OpenClaw Gateway config** (recommended): if the gateway passes `api.config.siyuan`, the plugin uses it directly.
+- **Config file**: `~/.openclaw/siyuan.config.json`
+- **Environment variables** (override file):
+  - `SIYUAN_API_URL`
+  - `SIYUAN_API_TOKEN`
+
+### Config File Example (`~/.openclaw/siyuan.config.json`)
 
 ```json
 {
