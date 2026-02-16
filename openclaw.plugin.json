@@ -1,0 +1,19 @@
+{
+  "id": "siyuan-openclaw-plugin",
+  "name": "Siyuan OpenClaw Plugin",
+  "description": "Siyuan recall + add memory via lifecycle hooks",
+  "version": "0.1.0",
+  "kind": "lifecycle",
+  "main": "./index.js",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "baseUrl": { "type": "string", "description": "MemOS Cloud base URL" },
+      "apiKey": {
+        "type": "string",
+        "description": "MemOS API Key (Token auth; supports ~/.openclaw/.env, ~/.moltbot/.env, ~/.clawdbot/.env; falls back to process env)"
+      }
+    },
+    "additionalProperties": false
+  }
+}

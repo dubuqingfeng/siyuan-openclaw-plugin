@@ -1,0 +1,49 @@
+{
+  "siyuan": {
+    "apiUrl": "http://127.0.0.1:6806",
+    "apiToken": "your-api-token-here"
+  },
+  "routing": {
+    "rules": [
+      {
+        "keywords": ["日记", "今天", "记录"],
+        "target": "daily_note",
+        "description": "Route diary entries to daily notes"
+      },
+      {
+        "keywords": ["会议", "meeting"],
+        "target": "/工作/会议记录",
+        "description": "Route meeting notes to work meetings folder"
+      },
+      {
+        "keywords": ["TODO", "任务", "待办"],
+        "target": "/GTD/任务箱",
+        "description": "Route tasks to GTD inbox"
+      },
+      {
+        "keywords": ["代码", "bug", "feature"],
+        "target": "/开发笔记/{project}",
+        "description": "Route development notes to project folders"
+      }
+    ],
+    "inboxPath": "/OpenClaw/收件箱",
+    "archivePath": "/OpenClaw/对话归档"
+  },
+  "index": {
+    "enabled": true,
+    "syncIntervalMs": 300000,
+    "dbPath": "~/.openclaw/index.sqlite"
+  },
+  "recall": {
+    "enabled": true,
+    "minPromptLength": 10,
+    "maxContextTokens": 2000,
+    "searchPaths": ["fulltext", "sql", "fts"]
+  },
+  "write": {
+    "enabled": true,
+    "captureStrategy": "smart",
+    "throttleMs": 3000,
+    "minContentLength": 50
+  }
+}

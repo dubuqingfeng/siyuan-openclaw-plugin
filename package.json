@@ -1,0 +1,37 @@
+{
+  "name": "siyuan-openclaw-plugin",
+  "version": "0.1.0",
+  "description": "OpenClaw Gateway plugin for SiYuan note-taking integration with memory recall and intelligent routing",
+  "main": "./index.js",
+  "type": "module",
+  "scripts": {
+    "test": "vitest",
+    "test:watch": "vitest --watch",
+    "test:coverage": "vitest --coverage",
+    "lint": "eslint src tests",
+    "lint:fix": "eslint src tests --fix"
+  },
+  "keywords": [
+    "openclaw",
+    "siyuan",
+    "plugin",
+    "gateway",
+    "memory",
+    "notes"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^2.0.0",
+    "eslint": "^9.0.0",
+    "vitest": "^2.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.13.5",
+    "better-sqlite3": "^11.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

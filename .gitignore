@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.log
+.env
+.DS_Store
+*.sqlite
+*.sqlite-journal
+.openclaw/
+.claude
+openclaw.config.json
