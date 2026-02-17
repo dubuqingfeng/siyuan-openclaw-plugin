@@ -103,6 +103,15 @@ export class SiYuanClient {
   }
 
   /**
+   * Get block kramdown source
+   * @param {string} id - Block ID
+   * @returns {Promise<{id: string, kramdown: string}>}
+   */
+  async getBlockKramdown(id) {
+    return await this.request("/api/block/getBlockKramdown", { id });
+  }
+
+  /**
    * Append block to parent
    * @param {object} params - Block parameters
    * @param {string} params.parentID - Parent block ID

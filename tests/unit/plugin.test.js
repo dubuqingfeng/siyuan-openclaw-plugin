@@ -8,6 +8,7 @@ vi.mock('../../src/clients/siyuan-client.js', () => ({
     listNotebooks: vi.fn().mockResolvedValue([
       { id: 'nb1', name: '日记' },
     ]),
+    getBlockKramdown: vi.fn().mockResolvedValue({ id: 'd1', kramdown: '# T' }),
   })),
 }));
 
@@ -100,6 +101,30 @@ describe('plugin lifecycle', () => {
       const result = await beforeStartHook(event);
 
       expect(result).toBeDefined();
+    });
+
+    it('should inject linkedDoc even when recall.enabled is false', async () => {
+      mockApi.config.recall = {
+        enabled: false,
+      };
+      // Ensure test is not affected by any user config file allowlists.
+      mockApi.config.linkedDoc = { enabled: true, hostKeywords: [], maxCount: 3 };
+
+      await register(mockApi);
+
+      const beforeStartHook = mockApi.on.mock.calls
+        .find(call => call[0] === 'before_agent_start')[1];
+
+      const event = {
+        // short prompt on purpose (bypass minPromptLength via linkedDoc)
+        prompt: 'http://127.0.0.1:9081?id=20220802180638-lhtbfty',
+        context: {},
+      };
+
+      const result = await beforeStartHook(event);
+
+      expect(result).toBeDefined();
+      expect(result.prependContext || '').toContain('```markdown');
     });
 
     it('should handle agent_end event', async () => {

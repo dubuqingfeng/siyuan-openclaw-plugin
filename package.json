@@ -8,7 +8,6 @@
     "test": "vitest",
     "test:watch": "vitest --watch",
     "test:coverage": "vitest --coverage",
-    "recall:sqlite": "node scripts/recall-sqlite.js",
     "lint": "eslint src tests",
     "lint:fix": "eslint src tests --fix"
   },

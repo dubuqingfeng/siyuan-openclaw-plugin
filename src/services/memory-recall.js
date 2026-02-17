@@ -1,6 +1,8 @@
 /**
  * Memory recall system for retrieving relevant notes before AI response
  */
+import { sanitizeKramdown } from "./index-sync.js";
+
 export class MemoryRecall {
   /**
    * @param {object} siyuanClient - SiYuan API client
@@ -21,7 +23,61 @@ export class MemoryRecall {
   async recall(prompt) {
     const minLength = this.config.recall?.minPromptLength || 10;
 
-    const gate = this.shouldRecall(prompt, minLength);
+    const linkedDocIds = this.extractLinkedDocIds(prompt);
+
+    const recallEnabled = this.config?.recall?.enabled ?? true;
+    const linkedDocEnabled = this.getLinkedDocConfig().enabled;
+
+    // Allow `linkedDoc` injection even when `recall.enabled=false`.
+    // In that mode, we ONLY fetch/inject linked docs (no search).
+    if (!recallEnabled) {
+      const text = (typeof prompt === "string" ? prompt : "").trim();
+
+      // Respect explicit skip commands even for linked-doc injection.
+      if (this.isRecallSkipCommand(text)) {
+        return {
+          prependContext: "",
+          recalledDocs: [],
+          skipped: true,
+          reason: "explicit_skip",
+        };
+      }
+
+      if (!linkedDocEnabled || linkedDocIds.length === 0) {
+        return {
+          prependContext: "",
+          recalledDocs: [],
+          skipped: true,
+          reason: "recall_disabled",
+        };
+      }
+
+      const linkedDocs = await this.fetchLinkedDocs(linkedDocIds);
+      if (linkedDocs.length === 0) {
+        return {
+          prependContext: "",
+          recalledDocs: [],
+          error: "No results found",
+        };
+      }
+
+      const maxDocsRaw = this.config.recall?.maxDocs;
+      const maxDocs = Number.isFinite(Number(maxDocsRaw))
+        ? Math.max(1, Number(maxDocsRaw))
+        : null;
+      const limitedDocs = maxDocs ? linkedDocs.slice(0, maxDocs) : linkedDocs;
+
+      return {
+        prependContext: this.formatContext(limitedDocs),
+        recalledDocs: limitedDocs,
+        linkedDocs: limitedDocs,
+        intent: { type: "linked_doc", keywords: [], timeRange: null },
+      };
+    }
+
+    const gate = this.shouldRecall(prompt, minLength, {
+      hasLinkedDoc: linkedDocIds.length > 0,
+    });
     if (!gate.should) {
       return {
         prependContext: "",
@@ -32,17 +88,22 @@ export class MemoryRecall {
     }
 
     try {
-      const searchPrompt = this.isRecallForceCommand(prompt)
+      const rawSearchPrompt = this.isRecallForceCommand(prompt)
         ? this.stripRecallCommandPrefix(prompt)
         : prompt;
+
+      const linkedDocs = await this.fetchLinkedDocs(linkedDocIds);
+      const searchPrompt = this.stripLinkedDocUrls(rawSearchPrompt);
 
       // Step 1: Analyze intent
       const intent = this.analyzeIntent(searchPrompt);
 
       // Step 2: Multi-path search
-      const blocks = await this.search(searchPrompt, intent);
+      const blocks = searchPrompt.trim()
+        ? await this.search(searchPrompt, intent)
+        : [];
 
-      if (blocks.length === 0) {
+      if (blocks.length === 0 && linkedDocs.length === 0) {
         return {
           prependContext: "",
           recalledDocs: [],
@@ -51,15 +112,24 @@ export class MemoryRecall {
       }
 
       // Step 3: Aggregate and rank results
-      const rankedDocs = this.aggregateResults(blocks, intent.keywords);
+      const rankedDocs =
+        blocks.length > 0 ? this.aggregateResults(blocks, intent.keywords) : [];
+      const mergedDocs = this.mergeDocs(linkedDocs, rankedDocs);
 
       // Step 4: Format as context
-      const context = this.formatContext(rankedDocs);
+      const maxDocsRaw = this.config.recall?.maxDocs;
+      const maxDocs = Number.isFinite(Number(maxDocsRaw))
+        ? Math.max(1, Number(maxDocsRaw))
+        : null;
+      const limitedDocs = maxDocs ? mergedDocs.slice(0, maxDocs) : mergedDocs;
+
+      const context = this.formatContext(limitedDocs);
 
       return {
         prependContext: context,
-        recalledDocs: rankedDocs,
+        recalledDocs: limitedDocs,
         intent,
+        linkedDocs: linkedDocs.length > 0 ? linkedDocs : undefined,
       };
     } catch (error) {
       console.error("[MemoryRecall] Recall failed:", error.message);
@@ -103,7 +173,8 @@ export class MemoryRecall {
 
   clampKeywordCount(words) {
     const maxKeywords = this.config.recall?.maxKeywords ?? 12;
-    if (!Array.isArray(words) || words.length <= maxKeywords) return words || [];
+    if (!Array.isArray(words) || words.length <= maxKeywords)
+      return words || [];
     return words.slice(0, maxKeywords);
   }
 
@@ -128,10 +199,17 @@ export class MemoryRecall {
       "个",
       "帮",
       "请",
+      "通过",
       "一下",
       "关于",
       "上周",
       "回顾",
+      // Query framing phrases (often appear in "search my notes ..." prompts)
+      "找笔记",
+      "查笔记",
+      "查一下",
+      "告诉我",
+      "帮我",
       "the",
       "is",
       "are",
@@ -151,15 +229,26 @@ export class MemoryRecall {
 
     const normalized = this.normalizeQuery(text);
 
+    // For CJK keyword extraction, treat common particles/framing phrases as separators so we
+    // don't end up with one long span like "告诉我张三的简历".
+    const normalizedForCJK = normalized
+      .replace(/(告诉我|帮我|麻烦|请|的)/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
     // Extract Chinese spans (2+ characters). These are usually higher-signal than overlapping bigrams.
-    const chineseWords = normalized.match(/[\u4e00-\u9fa5]{2,}/g) || [];
+    const chineseWords = normalizedForCJK.match(/[\u4e00-\u9fa5]{2,}/g) || [];
 
     // Optional: add a small number of 2-char bigrams only when Chinese spans are long
     // (helps recall without flooding the keyword set with noise).
     const splitChineseWords = [];
     for (const chunk of chineseWords) {
       if (chunk.length < 5) continue;
-      for (let i = 0; i < chunk.length - 1 && splitChineseWords.length < 20; i++) {
+      for (
+        let i = 0;
+        i < chunk.length - 1 && splitChineseWords.length < 20;
+        i++
+      ) {
         splitChineseWords.push(chunk.substring(i, i + 2));
       }
     }
@@ -169,19 +258,31 @@ export class MemoryRecall {
       .toLowerCase()
       .replace(/[^\p{L}\p{N}\s]/gu, " ")
       .split(/\s+/)
-      .filter((word) => word.length > 1 && !stopWords.includes(word));
+      // Keep this for Latin/alnum tokens; CJK spans are handled separately above.
+      .filter(
+        (word) =>
+          word.length > 1 &&
+          !stopWords.includes(word) &&
+          !/[\u4e00-\u9fa5]/.test(word),
+      );
 
     // Combine all
     const allWords = [...chineseWords, ...splitChineseWords, ...words]
       .map((w) => (typeof w === "string" ? w.trim() : ""))
       .filter((word) => word.length > 1 && !stopWords.includes(word));
 
+    const isCJKWord = (w) => /^[\u4e00-\u9fa5]{2,}$/.test(w);
+
     // Prefer longer tokens first; remove tokens that are contained by longer ones.
+    // NOTE: do NOT drop CJK tokens by containment. A longer Chinese span can contain
+    // the real entity name/topic (e.g. "告诉我张三的简历"), and dropping sub-tokens
+    // kills recall precision.
     const unique = [...new Set(allWords)].sort((a, b) => b.length - a.length);
     const filtered = [];
     for (const w of unique) {
       const isCJK2 = /^[\u4e00-\u9fa5]{2}$/.test(w);
-      if (!isCJK2 && filtered.some((kept) => kept.includes(w))) continue;
+      if (!isCJKWord(w) && !isCJK2 && filtered.some((kept) => kept.includes(w)))
+        continue;
       filtered.push(w);
     }
 
@@ -275,15 +376,13 @@ export class MemoryRecall {
    * This avoids unnecessary SiYuan queries for greetings/small-talk or explicit skip commands.
    * @param {string} prompt
    * @param {number} minLength
+   * @param {object} opts
+   * @param {boolean} opts.hasLinkedDoc
    * @returns {{should: boolean, reason: string}}
    */
-  shouldRecall(prompt, minLength = 10) {
+  shouldRecall(prompt, minLength = 10, opts = {}) {
     const text = (typeof prompt === "string" ? prompt : "").trim();
     console.log("[Openclaw siyuan] prompt", text);
-
-    if (!text || text.length < minLength) {
-      return { should: false, reason: "too_short" };
-    }
 
     // Explicit user control
     if (this.isRecallSkipCommand(text)) {
@@ -291,6 +390,15 @@ export class MemoryRecall {
     }
     if (this.isRecallForceCommand(text)) {
       return { should: true, reason: "explicit_force" };
+    }
+
+    // If user pasted a SiYuan share/app link (with a block/doc id), allow recall even for short prompts.
+    if (opts?.hasLinkedDoc) {
+      return { should: true, reason: "linked_doc" };
+    }
+
+    if (!text || text.length < minLength) {
+      return { should: false, reason: "too_short" };
     }
 
     // Skip greetings/small-talk even if long enough
@@ -309,6 +417,189 @@ export class MemoryRecall {
     }
 
     return { should: true, reason: "default" };
+  }
+
+  getLinkedDocConfig() {
+    // Preferred: top-level `linkedDoc`. Legacy: `recall.linkedDoc`.
+    const cfg = this.config?.linkedDoc ?? this.config?.recall?.linkedDoc;
+    const enabled = cfg?.enabled ?? true;
+    const hostKeywords = Array.isArray(cfg?.hostKeywords)
+      ? cfg.hostKeywords.map((x) => String(x || "").trim()).filter(Boolean)
+      : [];
+    const maxCountRaw = cfg?.maxCount;
+    const maxCount = Number.isFinite(Number(maxCountRaw))
+      ? Math.max(1, Number(maxCountRaw))
+      : 3;
+    return { enabled, hostKeywords, maxCount };
+  }
+
+  isAllowedLinkedDocUrl(urlString) {
+    const { enabled, hostKeywords } = this.getLinkedDocConfig();
+    if (!enabled) return false;
+    if (!hostKeywords || hostKeywords.length === 0) return true;
+
+    try {
+      const u = new URL(urlString);
+      const hay = `${u.hostname} ${u.host} ${u.href}`.toLowerCase();
+      return hostKeywords.some((k) => hay.includes(String(k).toLowerCase()));
+    } catch {
+      // If it isn't a parseable URL, be conservative when hostKeywords are configured.
+      return false;
+    }
+  }
+
+  extractLinkedDocIds(text) {
+    const { enabled, maxCount, hostKeywords } = this.getLinkedDocConfig();
+    if (!enabled) return [];
+
+    const raw = typeof text === "string" ? text : "";
+    if (!raw.trim()) return [];
+
+    // If a host/domain/IP allowlist is configured, require the prompt to mention at least one keyword.
+    // This avoids accidentally treating other "id=..." parameters as SiYuan doc ids.
+    if (hostKeywords.length > 0) {
+      const hay = raw.toLowerCase();
+      const ok = hostKeywords.some((k) =>
+        hay.includes(String(k).toLowerCase()),
+      );
+      if (!ok) return [];
+    }
+
+    // SiYuan block/document id shape: 14 digits + '-' + 7 base36-ish chars.
+    const idRe = /\b\d{14}-[a-z0-9]{7}\b/gi;
+
+    /** @type {string[]} */
+    const ids = [];
+
+    // 1) Prefer extracting from URLs (avoids accidentally matching other "id=" parameters).
+    const urlRe = /\bhttps?:\/\/[^\s<>"')\]]+/gi;
+    const urls = raw.match(urlRe) || [];
+    for (const u0 of urls) {
+      const u = String(u0 || "").trim();
+      if (!u) continue;
+      if (!this.isAllowedLinkedDocUrl(u)) continue;
+
+      try {
+        const parsed = new URL(u);
+        const qid = parsed.searchParams.get("id") || "";
+        const m = qid.match(idRe);
+        if (m && m[0]) ids.push(m[0].toLowerCase());
+
+        // Also allow `/.../20220802180638-xxxxxxx` style shares.
+        const pathMatches = parsed.pathname.match(idRe) || [];
+        for (const x of pathMatches) ids.push(String(x).toLowerCase());
+      } catch {
+        // Ignore parse failures
+      }
+    }
+
+    // 2) Fallback: extract any standalone ids (e.g. user pasted the id directly).
+    const loose = raw.match(idRe) || [];
+    for (const x of loose) ids.push(String(x).toLowerCase());
+
+    const unique = [...new Set(ids)].slice(0, maxCount);
+    return unique;
+  }
+
+  stripLinkedDocUrls(text) {
+    const raw = typeof text === "string" ? text : "";
+    if (!raw.trim()) return raw;
+
+    // Remove URLs that contain a SiYuan-style id, to prevent "47 94 239 ..." noise from polluting keywords.
+    const urlRe = /\bhttps?:\/\/[^\s<>"')\]]+/gi;
+    return raw.replace(urlRe, (u0) => {
+      const u = String(u0 || "");
+      const ids = this.extractLinkedDocIds(u);
+      return ids.length > 0 ? " " : u;
+    });
+  }
+
+  async fetchLinkedDocs(ids) {
+    const list = Array.isArray(ids) ? ids : [];
+    if (list.length === 0) return [];
+    if (!this.client || typeof this.client.getBlockKramdown !== "function")
+      return [];
+
+    const out = [];
+    for (const id0 of list) {
+      const id = String(id0 || "").trim();
+      if (!id) continue;
+      try {
+        const data = await this.client.getBlockKramdown(id);
+        const kramdown =
+          typeof data?.kramdown === "string" ? data.kramdown : "";
+        const markdown = sanitizeKramdown(kramdown);
+        if (!markdown.trim()) continue;
+
+        // Best-effort meta for display; do not fail the whole recall on this.
+        let info = null;
+        try {
+          if (typeof this.client.getBlockInfo === "function") {
+            info = await this.client.getBlockInfo(id);
+          }
+        } catch {
+          info = null;
+        }
+
+        const path =
+          info?.hpath ||
+          info?.hPath ||
+          info?.path ||
+          info?.name ||
+          `[linked:${id}]`;
+        const updated =
+          info?.updated ||
+          info?.updatedAt ||
+          info?.modified ||
+          info?.created ||
+          null;
+
+        out.push({
+          docId: id,
+          path,
+          updated,
+          // Keep a separate field so formatter can include full markdown.
+          markdown,
+          // Provide a block so existing scoring/formatters can still operate if needed.
+          blocks: [{ id, content: markdown, _score: 1, updated }],
+          _source: "linked_doc",
+          score: 1,
+        });
+      } catch (e) {
+        console.warn(
+          "[MemoryRecall] Failed to fetch linked doc:",
+          id,
+          e?.message,
+        );
+      }
+    }
+    return out;
+  }
+
+  mergeDocs(primary, secondary) {
+    const a = Array.isArray(primary) ? primary : [];
+    const b = Array.isArray(secondary) ? secondary : [];
+    if (a.length === 0) return b;
+    if (b.length === 0) return a;
+
+    const seen = new Set();
+    const out = [];
+    const push = (d) => {
+      if (!d) return;
+      const id = d.docId || d.root_id || d.id;
+      const key = String(id || "").trim();
+      if (!key) {
+        out.push(d);
+        return;
+      }
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(d);
+    };
+
+    for (const d of a) push(d);
+    for (const d of b) push(d);
+    return out;
   }
 
   /**
@@ -414,6 +705,22 @@ export class MemoryRecall {
     const trimmed = original.trim();
     if (!trimmed) return original;
 
+    // Fast path: strip if any force phrase appears near the beginning (users often write "通过 找笔记 ...").
+    // Keep it conservative to avoid stripping when the phrase appears later in the sentence as content.
+    const lower = trimmed.toLowerCase();
+    for (const p of this.getRecallForcePhrases()) {
+      const pl = String(p || "").toLowerCase();
+      if (!pl) continue;
+      const idx = lower.indexOf(pl);
+      if (idx >= 0 && idx <= 6) {
+        const after = trimmed
+          .slice(idx + p.length)
+          .replace(/^\s*(?:for|about|:|：|,|，|-)?\s*/i, "")
+          .trim();
+        return after || trimmed;
+      }
+    }
+
     const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const prefixes = this.getRecallForcePhrases().map(escapeRegex).join("|");
 
@@ -456,16 +763,18 @@ export class MemoryRecall {
         this.searchLocalFTS(normalizedQuery, {
           limit: twoStageEnabled ? candidateLimitPerPath : 20,
           keywords,
-        }).then((rows) =>
-          rows.map((b) => this.normalizeBlock(b, "fts")),
-        ),
+        }).then((rows) => rows.map((b) => this.normalizeBlock(b, "fts"))),
       );
     }
 
     // Full-text search via SiYuan API
     if (searchPaths.includes("fulltext")) {
       const options = twoStageEnabled
-        ? { page: 1, size: candidateLimitPerPath, ...(twoStage.fulltextOptions || {}) }
+        ? {
+            page: 1,
+            size: candidateLimitPerPath,
+            ...(twoStage.fulltextOptions || {}),
+          }
         : {};
       tasks.push(
         this.searchFullText(normalizedQuery, options).then((rows) =>
@@ -480,9 +789,7 @@ export class MemoryRecall {
         this.searchSQL(normalizedQuery, intent?.timeRange, {
           limit: twoStageEnabled ? candidateLimitPerPath : 20,
           keywords,
-        }).then((rows) =>
-          rows.map((b) => this.normalizeBlock(b, "sql")),
-        ),
+        }).then((rows) => rows.map((b) => this.normalizeBlock(b, "sql"))),
       );
     }
 
@@ -492,7 +799,10 @@ export class MemoryRecall {
       if (s.status === "fulfilled") {
         results.push(...(s.value || []));
       } else {
-        console.warn("[MemoryRecall] Search path failed:", s.reason?.message || s.reason);
+        console.warn(
+          "[MemoryRecall] Search path failed:",
+          s.reason?.message || s.reason,
+        );
       }
     }
 
@@ -531,13 +841,115 @@ export class MemoryRecall {
     return final;
   }
 
+  isCJKKeyword(w) {
+    return typeof w === "string" && /^[\u4e00-\u9fa5]{2,}$/.test(w.trim());
+  }
+
+  minKeywordMatchesForQuery(keywords) {
+    const ks = (Array.isArray(keywords) ? keywords : [])
+      .map((k) => (typeof k === "string" ? k.trim() : ""))
+      .filter((k) => k.length > 1);
+
+    // Heuristic: for short CJK keyword sets, users usually expect intersection semantics.
+    // Example: "张三 简历" should not return docs that only match "简历".
+    const cjk = ks.filter((k) => this.isCJKKeyword(k));
+    if (cjk.length >= 2 && ks.length <= 4) return 2;
+    return 1;
+  }
+
+  getKeywordCoverage(doc, keywords) {
+    const ks = Array.isArray(keywords) ? keywords : [];
+    const matched = new Set();
+    const pathLower = String(doc?.path || "").toLowerCase();
+    const blocks = Array.isArray(doc?.blocks) ? doc.blocks : [];
+
+    for (const k0 of ks) {
+      const k = String(k0 || "").trim();
+      if (!k) continue;
+      const kLower = k.toLowerCase();
+
+      if (pathLower.includes(kLower)) {
+        matched.add(k);
+        continue;
+      }
+
+      for (const b of blocks) {
+        const c = String(b?.content || "").toLowerCase();
+        if (c.includes(kLower)) {
+          matched.add(k);
+          break;
+        }
+      }
+    }
+
+    return { matchedCount: matched.size, matchedKeywords: [...matched] };
+  }
+
+  getTopicKeywords() {
+    const fromConfig = this.config.recall?.topicKeywords;
+    return Array.isArray(fromConfig)
+      ? fromConfig.map((s) => String(s || "").trim()).filter(Boolean)
+      : [];
+  }
+
+  getQueryTopicHits(keywords) {
+    const topics = new Set(this.getTopicKeywords());
+    if (topics.size === 0) return [];
+    const ks = Array.isArray(keywords) ? keywords : [];
+    const hits = [];
+    for (const k0 of ks) {
+      const k = String(k0 || "").trim();
+      if (k && topics.has(k)) hits.push(k);
+    }
+    return hits;
+  }
+
+  getAnchorKeywords(keywords) {
+    const topicHits = new Set(this.getQueryTopicHits(keywords));
+    const ks = (Array.isArray(keywords) ? keywords : [])
+      .map((k) => String(k || "").trim())
+      .filter((k) => k.length > 1 && !topicHits.has(k));
+
+    // Prefer longer entity-like tokens first. Keep only a small set of anchors.
+    // For CJK queries, a 2-3 char name often matters; for English, longer tokens win.
+    const sorted = [...new Set(ks)].sort((a, b) => b.length - a.length);
+    return sorted.slice(0, 2);
+  }
+
+  docMetaMatchesAnyTopic(doc, topicHits) {
+    const topics = Array.isArray(topicHits) ? topicHits : [];
+    if (topics.length === 0) return false;
+
+    const path = String(doc?.path || "");
+    for (const t of topics) {
+      if (t && path.includes(t)) return true;
+    }
+
+    // Also consider headings: first line of each block that looks like a Markdown heading.
+    const blocks = Array.isArray(doc?.blocks) ? doc.blocks : [];
+    for (const b of blocks) {
+      const content = typeof b?.content === "string" ? b.content : "";
+      const first = (content.split(/\r?\n/)[0] || "").trim();
+      if (!/^#{1,6}\s+/.test(first)) continue;
+      for (const t of topics) {
+        if (t && first.includes(t)) return true;
+      }
+    }
+
+    return false;
+  }
+
   /**
    * Search using full-text search
    * @param {string} query - Search query
    * @returns {Promise<Array>} Search results
    */
   async searchFullText(query, options = {}) {
-    if (options && typeof options === "object" && Object.keys(options).length > 0) {
+    if (
+      options &&
+      typeof options === "object" &&
+      Object.keys(options).length > 0
+    ) {
       return await this.client.searchFullText(query, options);
     }
     return await this.client.searchFullText(query);
@@ -573,12 +985,24 @@ export class MemoryRecall {
     const q = this.normalizeQuery(query);
     if (!keywords || keywords.length < 2) return q;
 
+    const isCJK = (w) => this.isCJKKeyword(w);
+    const ks = this.clampKeywordCount(keywords)
+      .map((k) => String(k || "").trim())
+      .filter(Boolean);
+    const cjk = ks.filter(isCJK);
+
+    // For short CJK queries, default to intersection semantics using phrase terms.
+    // This reduces noise from docs that match only one of the keywords.
+    if (cjk.length >= 2 && ks.length <= 4) {
+      return cjk
+        .slice(0, 4)
+        .map((k) => `\"${k}\"`)
+        .join(" ");
+    }
+
     // If the user query is long/natural-language, FTS "AND" matching can be too strict.
     // Build an "OR" query to increase recall in stage 1.
     if (q.length >= 18) {
-      const ks = this.clampKeywordCount(keywords)
-        .map((k) => String(k || "").trim())
-        .filter(Boolean);
       if (ks.length >= 2) return ks.join(" OR ");
     }
     return q;
@@ -593,7 +1017,9 @@ export class MemoryRecall {
    */
   async searchSQL(query, timeRange, options = {}) {
     const extracted = this.extractKeywords(query);
-    const keywords = Array.isArray(options.keywords) ? options.keywords : extracted;
+    const keywords = Array.isArray(options.keywords)
+      ? options.keywords
+      : extracted;
     const escapeLike = (s) =>
       String(s)
         .replace(/\\/g, "\\\\")
@@ -603,7 +1029,9 @@ export class MemoryRecall {
 
     const limited = this.clampKeywordCount(keywords);
     // SQLite requires ESCAPE to be a single character; use backslash.
-    const likeTerms = limited.map((k) => `content LIKE '%${escapeLike(k)}%' ESCAPE '\\'`);
+    const likeTerms = limited.map(
+      (k) => `content LIKE '%${escapeLike(k)}%' ESCAPE '\\'`,
+    );
     // Fallback to querying the raw query if keyword extraction yields nothing useful.
     if (likeTerms.length === 0 && query) {
       likeTerms.push(`content LIKE '%${escapeLike(query)}%' ESCAPE '\\'`);
@@ -619,6 +1047,9 @@ export class MemoryRecall {
     const stmt = `
       SELECT * FROM blocks
       WHERE (${whereClause})
+        AND type != 'd'
+        AND content IS NOT NULL
+        AND TRIM(content) != ''
       ORDER BY updated DESC
       LIMIT ${Number.isFinite(Number(options.limit)) ? Number(options.limit) : 20}
     `;
@@ -651,15 +1082,17 @@ export class MemoryRecall {
 
   scoreBlock(block, query, keywords) {
     const contentRaw = typeof block?.content === "string" ? block.content : "";
-    const content = contentRaw
-      .replace(/<[^>]+>/g, " ")
-      .toLowerCase();
+    const content = contentRaw.replace(/<[^>]+>/g, " ").toLowerCase();
     const path = (block?.hpath || "").toLowerCase();
     const q = (query || "").toLowerCase();
 
     // Base score per source (local FTS tends to be higher-precision, SQL the noisiest).
     const sourceWeight =
-      block?._source === "fts" ? 1.0 : block?._source === "fulltext" ? 0.9 : 0.75;
+      block?._source === "fts"
+        ? 1.0
+        : block?._source === "fulltext"
+          ? 0.9
+          : 0.75;
 
     let score = 0;
     if (q && q.length >= 3) {
@@ -737,17 +1170,61 @@ export class MemoryRecall {
     const grouped = this.groupByDocument(blocks);
 
     // Calculate relevance scores
-    const docs = Object.values(grouped).map((doc) => ({
-      ...doc,
-      updated: this.getDocUpdated(doc),
-      score: this.calculateRelevanceScore(doc, keywords),
-      recentlyEdited: this.isRecentlyEdited(doc),
-    }));
+    const minMatch = this.minKeywordMatchesForQuery(keywords);
+    const docs = Object.values(grouped).map((doc) => {
+      const coverage = this.getKeywordCoverage(doc, keywords);
+      const baseScore = this.calculateRelevanceScore(doc, keywords);
+      const coverageFactor =
+        minMatch > 1 ? Math.min(1, coverage.matchedCount / minMatch) : 1;
+
+      return {
+        ...doc,
+        updated: this.getDocUpdated(doc),
+        score: baseScore * coverageFactor,
+        keywordCoverage: coverage,
+        recentlyEdited: this.isRecentlyEdited(doc),
+      };
+    });
 
     // Sort by score
     docs.sort((a, b) => b.score - a.score);
 
-    return docs;
+    // Filter obvious false positives for short CJK queries: require at least N distinct keyword hits
+    // across the document (path + blocks). Fall back to the unfiltered list if we'd otherwise return nothing.
+    const filtered = docs.filter(
+      (d) => (d.keywordCoverage?.matchedCount ?? 0) >= minMatch,
+    );
+    let candidates = filtered.length > 0 ? filtered : docs;
+
+    // Generic narrowing:
+    // 1) If the query contains any configured "topic" keywords (e.g. 简历/周报/会议纪要),
+    //    prefer documents whose meta (path or headings) mention those topics.
+    const topicHits = this.getQueryTopicHits(keywords);
+    if (topicHits.length > 0) {
+      const metaMatches = candidates.filter((d) =>
+        this.docMetaMatchesAnyTopic(d, topicHits),
+      );
+      if (metaMatches.length > 0) {
+        candidates = metaMatches;
+      }
+    }
+
+    // 2) If we can identify anchor keywords (typically entities like names), require at least
+    //    one anchor match when that would reduce noise without yielding an empty set.
+    const anchors = this.getAnchorKeywords(keywords);
+    if (anchors.length > 0) {
+      const anchorSet = new Set(anchors);
+      const anchorMatches = candidates.filter((d) =>
+        (d.keywordCoverage?.matchedKeywords || []).some((k) =>
+          anchorSet.has(k),
+        ),
+      );
+      if (anchorMatches.length > 0) {
+        candidates = anchorMatches;
+      }
+    }
+
+    return candidates;
   }
 
   getDocUpdated(doc) {
@@ -798,7 +1275,9 @@ export class MemoryRecall {
         const kw = String(keyword || "").toLowerCase();
         if (!kw) continue;
         const matchingBlocks = blocks.filter((b) =>
-          String(b?.content || "").toLowerCase().includes(kw),
+          String(b?.content || "")
+            .toLowerCase()
+            .includes(kw),
         );
         score += matchingBlocks.length / totalBlocks;
       }
@@ -839,6 +1318,7 @@ export class MemoryRecall {
    */
   formatContext(docs) {
     if (docs.length === 0) {
+      console.log("[siyuan] No documents found");
       return "";
     }
 
@@ -850,8 +1330,11 @@ export class MemoryRecall {
     let currentLength = context.length;
 
     for (const doc of docs) {
-      const docSection = this.formatDocument(doc);
+      const remaining = maxChars - currentLength;
+      if (remaining <= 0) break;
+      const docSection = this.formatDocument(doc, { maxChars: remaining });
 
+      if (!docSection) break;
       if (currentLength + docSection.length > maxChars) {
         break;
       }
@@ -868,11 +1351,35 @@ export class MemoryRecall {
   /**
    * Format single document
    * @param {object} doc - Document info
+   * @param {object} opts
+   * @param {number} opts.maxChars - Max chars allowed for this section
    * @returns {string} Formatted document section
    */
-  formatDocument(doc) {
+  formatDocument(doc, opts = {}) {
+    const maxChars =
+      Number.isFinite(Number(opts.maxChars)) && Number(opts.maxChars) > 0
+        ? Number(opts.maxChars)
+        : Infinity;
+
     const date = doc.updated || this.getDocUpdated(doc) || "未知日期";
-    let section = `## 📄 ${doc.path} (${date})\n`;
+    const path = doc.path || `[doc:${doc.docId || doc.id || "unknown"}]`;
+
+    // Linked-doc mode: include full markdown (truncated to fit overall context budget).
+    const mdRaw = typeof doc.markdown === "string" ? doc.markdown : "";
+    if (mdRaw.trim()) {
+      const header = `## 🔗 ${path} (${date})\n`;
+      const pre = `${header}\`\`\`markdown\n`;
+      const post = `\n\`\`\`\n`;
+      const room = maxChars - (pre.length + post.length);
+      if (room <= 60) return ""; // not enough room to be useful
+      let md = mdRaw.trim();
+      if (md.length > room) {
+        md = md.slice(0, Math.max(0, room - 3)).trimEnd() + "...";
+      }
+      return pre + md + post;
+    }
+
+    let section = `## 📄 ${path} (${date})\n`;
 
     // Take top blocks (limit to avoid too much content)
     const topBlocks = (doc.blocks || [])
@@ -885,7 +1392,18 @@ export class MemoryRecall {
         typeof block.content === "string" ? block.content : ""
       ).trim();
       if (content.length > 0) {
-        section += `- ${content}\n`;
+        const lines = content
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean);
+        const first = lines[0] || "";
+        const headingMatch = first.match(/^(#{1,6})\s+(.*)$/);
+        const title = headingMatch ? headingMatch[2] : first;
+        const rest = lines.slice(1).join(" ");
+        const excerpt = rest.length > 240 ? rest.slice(0, 240) + "..." : rest;
+
+        section += `- ${title}\n`;
+        if (excerpt) section += `  ${excerpt}\n`;
       }
     }
 

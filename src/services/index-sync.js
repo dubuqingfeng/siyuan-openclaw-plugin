@@ -4,6 +4,208 @@
  * Keeps IndexManager focused on local SQLite/FTS concerns; all remote fetch/query,
  * batching, and exclusion policy lives here.
  */
+
+function parseSectionHeadingLevels(value) {
+  const raw = Array.isArray(value) ? value : value == null ? null : [value];
+  if (!raw) return new Set();
+
+  const out = new Set();
+  for (const v of raw) {
+    if (typeof v === "number" && Number.isFinite(v)) {
+      const n = Math.trunc(v);
+      if (n >= 1 && n <= 6) out.add(n);
+      continue;
+    }
+    if (typeof v === "string") {
+      const s = v.trim().toLowerCase();
+      if (!s) continue;
+      const m = s.match(/^h([1-6])$/);
+      if (m) {
+        out.add(Number(m[1]));
+        continue;
+      }
+      const n = Number(s);
+      if (Number.isFinite(n)) {
+        const nn = Math.trunc(n);
+        if (nn >= 1 && nn <= 6) out.add(nn);
+      }
+    }
+  }
+  return out;
+}
+
+function normalizeLineForDedup(line) {
+  // Treat "1. xxx" and "xxx" as duplicates, likewise for "- xxx".
+  // Keep this conservative to avoid deleting genuinely different lines.
+  let s = String(line || "").trim();
+  if (!s) return "";
+  s = s
+    .replace(/^\d+\s*[.)]\s+/, "") // "1. " / "1) "
+    .replace(/^[-*+]\s+/, "") // "- " / "* " / "+ "
+    .replace(/^（\d+）\s+/, "") // "（1） "
+    .replace(/^\(\d+\)\s+/, ""); // "(1) "
+  return s.trim();
+}
+
+export function sanitizeKramdown(text) {
+  const t = String(text || "");
+  if (!t.trim()) return "";
+
+  // 1) Remove standalone kramdown attribute lines like `{: id="..."}`.
+  // 2) Remove inline attribute blobs like `{: id="..."}` inside list/paragraph lines.
+  return t
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*\{:\s*[^}]*\}\s*$/.test(line))
+    .map((line) => line.replace(/\{\:\s*[^}]*\}/g, "").replace(/[ \t]+$/g, ""))
+    .join("\n")
+    .trim();
+}
+
+function makeWindowDeduper(windowSize) {
+  const size = Math.max(0, Number(windowSize ?? 0));
+  if (!Number.isFinite(size) || size <= 0) {
+    return {
+      seen: () => false,
+      add: () => {},
+      reset: () => {},
+    };
+  }
+
+  /** @type {string[]} */
+  const queue = [];
+  /** @type {Map<string, number>} */
+  const counts = new Map();
+
+  return {
+    seen(norm) {
+      return counts.has(norm);
+    },
+    add(norm) {
+      queue.push(norm);
+      counts.set(norm, (counts.get(norm) || 0) + 1);
+      while (queue.length > size) {
+        const old = queue.shift();
+        const c = counts.get(old) || 0;
+        if (c <= 1) counts.delete(old);
+        else counts.set(old, c - 1);
+      }
+    },
+    reset() {
+      queue.length = 0;
+      counts.clear();
+    },
+  };
+}
+
+export function buildSectionEntriesFromMarkdown(markdown, config, docIdForSyntheticIds = "") {
+  const levels = parseSectionHeadingLevels(config?.index?.sectionHeadingLevels);
+  if (levels.size === 0) return [];
+
+  const maxSectionsToIndex = Math.max(
+    0,
+    Number(config?.index?.maxSectionsToIndex ?? 80),
+  );
+  const sectionMaxChars = Math.max(
+    200,
+    Number(config?.index?.sectionMaxChars ?? 1200),
+  );
+
+  const dedupLines = config?.index?.sectionDedupLines ?? true;
+  const windowSize = Number(config?.index?.sectionDedupWindowSize ?? 200);
+  const deduper = makeWindowDeduper(windowSize);
+
+  const md = String(markdown || "");
+  if (!md.trim()) return [];
+
+  const sections = [];
+  let current = null; // { id, level, title, bodyLines: [] }
+  let lastLine = "";
+  let lastNorm = "";
+
+  const flush = () => {
+    if (!current) return;
+    const heading = `${"#".repeat(current.level)} ${current.title}`.trim();
+    let content = heading;
+    const body = current.bodyLines.join("\n").trim();
+    if (body) content += `\n${body}`;
+    if (content.length > sectionMaxChars) {
+      content = content.slice(0, sectionMaxChars - 3).trimEnd() + "...";
+    }
+    sections.push({ id: current.id, content });
+  };
+
+  const lines = md.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const line = String(raw || "").trim();
+    if (!line) continue;
+
+    const m = line.match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (m) {
+      const level = m[1].length;
+      if (levels.has(level)) {
+        flush();
+        deduper.reset();
+        lastLine = "";
+        lastNorm = "";
+        const title = m[2].trim();
+        const id = docIdForSyntheticIds
+          ? `${docIdForSyntheticIds}::h${level}::${i}`
+          : `h${level}::${i}`;
+        current = { id, level, title, bodyLines: [] };
+        if (maxSectionsToIndex > 0 && sections.length >= maxSectionsToIndex) break;
+        continue;
+      }
+    }
+
+    if (!current) continue;
+
+    if (!dedupLines) {
+      current.bodyLines.push(line);
+      continue;
+    }
+
+    const n = normalizeLineForDedup(line);
+    if (!n) continue;
+    if (n === lastNorm || line === lastLine) continue;
+    if (deduper.seen(n)) continue;
+    current.bodyLines.push(line);
+    lastLine = line;
+    lastNorm = n;
+    deduper.add(n);
+  }
+
+  flush();
+  return maxSectionsToIndex > 0 ? sections.slice(0, maxSectionsToIndex) : [];
+}
+
+function buildDocContentFromMarkdown(markdown, config) {
+  const dedupLines = config?.index?.docContentDedupLines ?? true;
+  const windowSize = Number(config?.index?.docContentDedupWindowSize ?? 400);
+  const deduper = makeWindowDeduper(windowSize);
+
+  const md = String(markdown || "");
+  if (!md.trim()) return "";
+  if (!dedupLines) return md.trim();
+
+  const out = [];
+  let lastLine = "";
+  let lastNorm = "";
+  for (const raw of md.split(/\r?\n/)) {
+    const line = String(raw || "").trim();
+    if (!line) continue;
+    const n = normalizeLineForDedup(line);
+    if (!n) continue;
+    if (n === lastNorm || line === lastLine) continue;
+    if (deduper.seen(n)) continue;
+    out.push(line);
+    lastLine = line;
+    lastNorm = n;
+    deduper.add(n);
+  }
+  return out.join("\n");
+}
+
 export class IndexSyncService {
   /**
    * @param {object} deps
@@ -100,14 +302,6 @@ export class IndexSyncService {
       console.log("[OpenClaw SiYuan] Starting initial index sync...");
 
       const escapeSqlString = (s) => String(s ?? "").replace(/'/g, "''");
-      const maxBlocksForDocContent = Math.max(
-        1,
-        Number(this.config.index?.maxBlocksForDocContent ?? 2000),
-      );
-      const maxBlocksToIndex = Math.max(
-        1,
-        Number(this.config.index?.maxBlocksToIndex ?? 600),
-      );
       const excludedNotebookNames = this.getExcludedNotebookNamesFromConfig();
       const sqlPageSize = Math.max(
         1,
@@ -153,25 +347,14 @@ export class IndexSyncService {
             const docId = doc?.id;
             if (!docId) continue;
 
-            // Build doc-level content from its blocks; doc block `content` is usually title only.
-            const blocksRows = await this.siyuanClient.query(`
-              SELECT id, content, updated
-              FROM blocks
-              WHERE root_id = '${escapeSqlString(docId)}'
-                AND type != 'd'
-                AND content IS NOT NULL
-                AND TRIM(content) != ''
-              ORDER BY updated ASC
-              LIMIT ${maxBlocksForDocContent}
-            `);
-            const blocks = Array.isArray(blocksRows) ? blocksRows : [];
-
-            const docContent = blocks
-              .map((b) =>
-                typeof b?.content === "string" ? b.content.trim() : "",
-              )
-              .filter(Boolean)
-              .join("\n");
+            const data = await this.siyuanClient.getBlockKramdown(docId);
+            const kramdown = sanitizeKramdown(data?.kramdown || "");
+            const docContent = buildDocContentFromMarkdown(kramdown, this.config);
+            const sectionEntries = buildSectionEntriesFromMarkdown(
+              kramdown,
+              this.config,
+              docId,
+            );
 
             docsToSync.push({
               id: docId,
@@ -180,11 +363,7 @@ export class IndexSyncService {
               notebookName: notebook?.name,
               notebookId: doc?.box || notebook?.id,
               content: docContent,
-              blocks: blocks.slice(-maxBlocksToIndex).map((b) => ({
-                id: b.id,
-                content: b.content,
-                updated: b.updated,
-              })),
+              blocks: sectionEntries,
               updated: doc?.updated,
             });
           }
@@ -235,14 +414,6 @@ export class IndexSyncService {
 
     try {
       const escapeSqlString = (s) => String(s ?? "").replace(/'/g, "''");
-      const maxBlocksForDocContent = Math.max(
-        1,
-        Number(this.config.index?.maxBlocksForDocContent ?? 200),
-      );
-      const maxBlocksToIndex = Math.max(
-        1,
-        Number(this.config.index?.maxBlocksToIndex ?? 60),
-      );
 
       // Refresh caches best-effort; exclusion should still work by notebookId if cache exists.
       if (!this.notebookIdToNameCache || this.notebookIdToNameCache.size === 0) {
@@ -290,23 +461,14 @@ export class IndexSyncService {
             continue;
           }
 
-          const blocks = await this.siyuanClient.query(`
-            SELECT id, content, updated
-            FROM blocks
-            WHERE root_id = '${escapeSqlString(docId)}'
-              AND type != 'd'
-              AND content IS NOT NULL
-              AND TRIM(content) != ''
-            ORDER BY updated ASC
-            LIMIT ${maxBlocksForDocContent}
-          `);
-
-          const docContent = blocks
-            .map((b) =>
-              typeof b?.content === "string" ? b.content.trim() : "",
-            )
-            .filter(Boolean)
-            .join("\n");
+          const data = await this.siyuanClient.getBlockKramdown(docId);
+          const kramdown = sanitizeKramdown(data?.kramdown || "");
+          const docContent = buildDocContentFromMarkdown(kramdown, this.config);
+          const sectionEntries = buildSectionEntriesFromMarkdown(
+            kramdown,
+            this.config,
+            docId,
+          );
 
           docsToSync.push({
             id: docId,
@@ -315,11 +477,7 @@ export class IndexSyncService {
             notebookId: docRow?.box,
             notebookName: this.notebookIdToNameCache?.get(docRow?.box),
             content: docContent,
-            blocks: blocks.slice(-maxBlocksToIndex).map((b) => ({
-              id: b.id,
-              content: b.content,
-              updated: b.updated,
-            })),
+            blocks: sectionEntries,
             updated: docRow.updated,
           });
         }
@@ -343,4 +501,3 @@ export class IndexSyncService {
     }
   }
 }
-

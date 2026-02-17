@@ -68,35 +68,20 @@ pnpm install
 
 你可以通过配置覆盖每篇文档拼接/保留的块数量（可选）：
 
+本插件本地索引默认使用“整篇文档的 kramdown 源码”作为单一来源（需要思源 HTTP API 支持 `/api/block/getBlockKramdown`），这样通常比拼接 blocks 更稳定（尤其是有序列表 1.2.3.）。
+
+你也可以按标题层级把一篇文档切成“小节”来做本地索引（更推荐，用于提升相关性，默认按 H2）：
+
 ```json
 {
   "index": {
-    "maxBlocksForDocContent": 200,
-    "maxBlocksToIndex": 60
+    "sectionHeadingLevels": [2],
+    "maxSectionsToIndex": 80,
+    "sectionMaxChars": 1200
   }
 }
-```
-
-## 离线测试（SQLite）
-
-你可以在不启动思源 HTTP API 的情况下，直接用 SQLite 文件测试 recall 管线：
-
-```bash
-pnpm recall:sqlite -- --siyuan-db /path/to/siyuan.db --prompt "Rust ownership 是什么？" --force
-```
-
-`--siyuan-db` 支持两类 DB：
-
-- 思源原始库：包含 `blocks` 表
-- OpenClaw 本地索引库：包含 `block_fts` + `doc_registry`
-
-可选：从思源原始库临时构建一个 FTS 索引，并启用 `fts` 通路：
-
-```bash
-pnpm recall:sqlite -- --siyuan-db /path/to/siyuan.db --prompt "OAuth token 刷新" --build-index --paths fts,sql
 ```
 
 ## 设计文档
 
 - `DESIGN.md`：生命周期、架构与关键流程图
-

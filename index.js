@@ -6,6 +6,31 @@ import { RoutingEngine } from "./src/services/routing-engine.js";
 import { ContentWriter } from "./src/services/content-writer.js";
 import { IndexSyncService } from "./src/services/index-sync.js";
 
+function deepMerge(target, source) {
+  const t = target && typeof target === "object" ? target : {};
+  const s = source && typeof source === "object" ? source : {};
+  const out = Array.isArray(t) ? [...t] : { ...t };
+
+  for (const key of Object.keys(s)) {
+    const sv = s[key];
+    const tv = out[key];
+    if (
+      sv &&
+      typeof sv === "object" &&
+      !Array.isArray(sv) &&
+      tv &&
+      typeof tv === "object" &&
+      !Array.isArray(tv)
+    ) {
+      out[key] = deepMerge(tv, sv);
+    } else {
+      out[key] = sv;
+    }
+  }
+
+  return out;
+}
+
 /**
  * Plugin state
  */
@@ -41,7 +66,12 @@ export function register(api) {
   console.log("[OpenClaw SiYuan] Registering plugin...");
 
   // Step 1: Build configuration
-  config = api.config?.siyuan ? { siyuan: api.config.siyuan } : buildConfig();
+  // Always start from file/env/default config, then apply gateway overrides (if any).
+  // This avoids accidentally dropping `index/recall/write` settings when `api.config.siyuan` is present.
+  config = buildConfig();
+  if (api?.config && typeof api.config === "object") {
+    config = deepMerge(config, api.config);
+  }
 
   console.log("[OpenClaw SiYuan] Configuration loaded");
 
@@ -68,6 +98,28 @@ export function register(api) {
 
   // Step 5: Background initialization (gateway ignores async registration promises)
   initPromise = (async () => {
+    // Initialize local index first (offline recall can still work without SiYuan connectivity).
+    if (config.index?.enabled) {
+      try {
+        indexManager = new IndexManager({
+          dbPath: config.index.dbPath,
+          privacyNotebook: config.index?.privacyNotebook,
+          archiveNotebook: config.index?.archiveNotebook,
+          skipNotebookNames: config.index?.skipNotebookNames,
+        });
+        console.log("[OpenClaw SiYuan] Local index initialized");
+      } catch (error) {
+        console.error(
+          "[OpenClaw SiYuan] Failed to initialize index:",
+          error.message,
+        );
+        indexManager = null;
+      }
+    }
+
+    // Attach index manager for local FTS searches (optional)
+    memoryRecall.indexManager = indexManager;
+
     // Health check
     const healthResult = await siyuanClient.healthCheck();
     siyuanAvailable = healthResult.available;
@@ -80,44 +132,25 @@ export function register(api) {
       console.warn(
         "[OpenClaw SiYuan] SiYuan not available, running in degraded mode",
       );
+      // Keep local index/recall available even in degraded mode.
       return { siyuanAvailable: false, version: healthResult.version };
     }
 
-    // Initialize index manager if enabled
-    if (config.index?.enabled) {
+    // Start index sync only when both SiYuan and local index are available.
+    if (config.index?.enabled && indexManager) {
+      indexSync = new IndexSyncService({ siyuanClient, indexManager, config });
       try {
-        indexManager = new IndexManager({
-          dbPath: config.index.dbPath,
-          privacyNotebook: config.index?.privacyNotebook,
-          archiveNotebook: config.index?.archiveNotebook,
-          skipNotebookNames: config.index?.skipNotebookNames,
-        });
-        console.log("[OpenClaw SiYuan] Local index initialized");
-
-        indexSync = new IndexSyncService({ siyuanClient, indexManager, config });
-        try {
-          await indexSync.refreshNotebookCache();
-        } catch (error) {
-          console.warn(
-            "[OpenClaw SiYuan] Failed to refresh notebook cache:",
-            error?.message || String(error),
-          );
-        }
-
-        await indexSync.performInitialSync();
-        indexSync.startBackgroundSync();
+        await indexSync.refreshNotebookCache();
       } catch (error) {
-        console.error(
-          "[OpenClaw SiYuan] Failed to initialize index:",
-          error.message,
+        console.warn(
+          "[OpenClaw SiYuan] Failed to refresh notebook cache:",
+          error?.message || String(error),
         );
-        indexManager = null;
-        indexSync = null;
       }
-    }
 
-    // Attach index manager for local FTS searches (optional)
-    memoryRecall.indexManager = indexManager;
+      await indexSync.performInitialSync();
+      indexSync.startBackgroundSync();
+    }
 
     return { siyuanAvailable, version: healthResult.version };
   })();
@@ -160,22 +193,42 @@ function registerLifecycleHooks(api) {
  */
 async function handleBeforeAgentStart(event) {
   await ensureInitialized();
-  // Pre-checks
-  if (!config.recall?.enabled) {
+  const prompt = typeof event?.prompt === "string" ? event.prompt : "";
+  const recallEnabled = config?.recall?.enabled ?? false;
+  const linkedDocEnabled =
+    config?.linkedDoc?.enabled ?? config?.recall?.linkedDoc?.enabled ?? true;
+  const linkedDocIds =
+    linkedDocEnabled && memoryRecall
+      ? memoryRecall.extractLinkedDocIds(prompt)
+      : [];
+
+  // Pre-checks:
+  // - Normal recall requires `recall.enabled=true`.
+  // - Linked doc injection can run independently when `linkedDoc.enabled=true`.
+  const allowLinkedDocOnly = linkedDocEnabled && linkedDocIds.length > 0;
+  if (!recallEnabled && !allowLinkedDocOnly) {
     return {};
   }
 
-  if (!event.prompt || event.prompt.length < config.recall.minPromptLength) {
+  // For normal recall, keep the min length gate. Linked-doc injection bypasses it.
+  if (
+    recallEnabled &&
+    (!prompt || prompt.length < config.recall.minPromptLength)
+  ) {
     return {};
   }
 
-  if (!siyuanAvailable) {
-    // SiYuan might recover after startup; re-check once at write time.
+  // If we need SiYuan (linked docs always do), attempt a quick reconnect.
+  const needsSiyuan =
+    allowLinkedDocOnly || (recallEnabled && !memoryRecall?.indexManager);
+  if (!siyuanAvailable && needsSiyuan) {
     const healthResult = await siyuanClient.healthCheck();
     siyuanAvailable = healthResult.available;
     if (!siyuanAvailable) {
-      console.warn("[OpenClaw SiYuan] Cannot write: SiYuan unavailable");
-      return;
+      console.warn(
+        `[OpenClaw SiYuan] Cannot recall: SiYuan unavailable (needsSiyuan=${needsSiyuan})`,
+      );
+      return {};
     }
     console.log(
       `[OpenClaw SiYuan] Reconnected to SiYuan ${healthResult.version}`,
@@ -185,10 +238,10 @@ async function handleBeforeAgentStart(event) {
   try {
     console.log(
       "[OpenClaw SiYuan] Recalling memories for prompt:",
-      event.prompt.substring(0, 50),
+      prompt.substring(0, 50),
     );
 
-    const result = await memoryRecall.recall(event.prompt);
+    const result = await memoryRecall.recall(prompt);
 
     if (result.prependContext) {
       console.log(

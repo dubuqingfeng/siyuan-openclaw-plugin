@@ -23,12 +23,41 @@ const DEFAULT_CONFIG = {
     privacyNotebook: "",
     archiveNotebook: "",
     skipNotebookNames: [],
+
+    // Optional: split documents into sections by heading levels for better retrieval relevance.
+    // Examples: [2] (H2), [1,2] (H1+H2), ["h3"] (H3), [] (disable section splitting).
+    sectionHeadingLevels: [2],
+    maxSectionsToIndex: 80,
+    sectionMaxChars: 1200,
+    // Best-effort de-duplicate consecutive identical lines when building section content.
+    sectionDedupLines: true,
+    // Window size for de-dup (applies when sectionDedupLines=true). Helps remove repeated list groups.
+    sectionDedupWindowSize: 200,
+    // Also apply line de-dup to doc.content (the doc-level FTS entry).
+    docContentDedupLines: true,
+    docContentDedupWindowSize: 400,
   },
   recall: {
     enabled: true,
     minPromptLength: 10,
     maxContextTokens: 2000,
+    // Optional: cap number of recalled documents injected into context.
+    // (Blocks per doc are still controlled by perDocBlockCap/finalBlockLimit in twoStage.)
+    maxDocs: 5,
+    // Optional: "topic" keywords used to narrow candidates by doc meta (path/headings).
+    // Keep this small; treat as user-configurable vocabulary.
+    topicKeywords: ["简历", "周报", "日报", "会议纪要", "复盘", "总结"],
     searchPaths: ["fulltext", "sql", "fts"],
+  },
+  // If the prompt contains a SiYuan share/app link (domain/IP + ?id=...), fetch that doc's markdown
+  // and inject it into context. This is intentionally separate from `recall.enabled`.
+  linkedDoc: {
+    enabled: true,
+    // Optional host/domain/IP keywords to restrict which links are considered (substring match).
+    // Example: ["127.0.0.1", "notes.example.com"]
+    hostKeywords: [],
+    // Safety cap: maximum number of linked docs to fetch per prompt.
+    maxCount: 3,
   },
   write: {
     enabled: true,
@@ -141,6 +170,47 @@ export function validateConfig(config) {
 
   if (config.recall && typeof config.recall.maxContextTokens !== "number") {
     errors.push("recall.maxContextTokens must be a number");
+  }
+  if (
+    config.recall &&
+    config.recall.maxDocs != null &&
+    typeof config.recall.maxDocs !== "number"
+  ) {
+    errors.push("recall.maxDocs must be a number or null");
+  }
+  if (config.recall && config.recall.topicKeywords != null) {
+    if (!Array.isArray(config.recall.topicKeywords)) {
+      errors.push("recall.topicKeywords must be an array");
+    } else if (
+      config.recall.topicKeywords.some(
+        (x) => typeof x !== "string" || !String(x).trim(),
+      )
+    ) {
+      errors.push("recall.topicKeywords must contain non-empty strings");
+    }
+  }
+  // linkedDoc can be configured at top-level (preferred) or under recall (legacy).
+  const linkedDocCfg = config?.linkedDoc ?? config?.recall?.linkedDoc;
+  if (linkedDocCfg != null) {
+    const ld = linkedDocCfg;
+    if (typeof ld !== "object" || Array.isArray(ld)) {
+      errors.push("linkedDoc must be an object");
+    } else {
+      if (ld.hostKeywords != null && !Array.isArray(ld.hostKeywords)) {
+        errors.push("linkedDoc.hostKeywords must be an array");
+      } else if (
+        Array.isArray(ld.hostKeywords) &&
+        ld.hostKeywords.some((x) => typeof x !== "string" || !String(x).trim())
+      ) {
+        errors.push("linkedDoc.hostKeywords must contain non-empty strings");
+      }
+      if (ld.maxCount != null && typeof ld.maxCount !== "number") {
+        errors.push("linkedDoc.maxCount must be a number");
+      }
+      if (ld.enabled != null && typeof ld.enabled !== "boolean") {
+        errors.push("linkedDoc.enabled must be a boolean");
+      }
+    }
   }
 
   if (

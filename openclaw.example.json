@@ -43,6 +43,11 @@
     "maxContextTokens": 2000,
     "searchPaths": ["fulltext", "sql", "fts"]
   },
+  "linkedDoc": {
+    "enabled": true,
+    "hostKeywords": [],
+    "maxCount": 3
+  },
   "write": {
     "enabled": true,
     "captureStrategy": "smart",
