@@ -32,7 +32,10 @@
   "index": {
     "enabled": true,
     "syncIntervalMs": 300000,
-    "dbPath": "~/.openclaw/index.sqlite"
+    "dbPath": "~/.openclaw/index.sqlite",
+    "privacyNotebook": "",
+    "archiveNotebook": "",
+    "skipNotebookNames": []
   },
   "recall": {
     "enabled": true,

@@ -19,6 +19,10 @@ const DEFAULT_CONFIG = {
     enabled: true,
     syncIntervalMs: 5 * 60 * 1000, // 5 minutes
     dbPath: join(homedir(), ".openclaw", "index.sqlite"),
+    // Optional: exclude sensitive/archived notebooks from local indexing.
+    privacyNotebook: "",
+    archiveNotebook: "",
+    skipNotebookNames: [],
   },
   recall: {
     enabled: true,
@@ -62,15 +66,21 @@ function resolveConfigPath(configPath) {
   // If caller explicitly provided a path, don't guess.
   if (configPath) return configPath;
 
+  const cwd = process.cwd();
   const candidates = [
-    // Fallback to user home
+    // User home config (primary default).
     join(homedir(), ".openclaw", "siyuan.config.json"),
+
+    // Prefer explicit project-local config when present (useful for dev/tests).
+    join(cwd, "openclaw.config.json"),
+    join(cwd, "openclaw.json"),
+
+    // Backwards-compatible fallback.
+    join(homedir(), ".openclaw", "openclaw.json"),
   ];
 
-  // Keep backwards-compatible behavior: default to ~/.openclaw/openclaw.json
-  return (
-    candidates.find((p) => existsSync(p)) || candidates[candidates.length - 1]
-  );
+  // Default to the primary home config location even if it doesn't exist yet.
+  return candidates.find((p) => existsSync(p)) || candidates[0];
 }
 
 /**

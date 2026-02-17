@@ -142,9 +142,23 @@ pnpm lint
 pnpm lint:fix
 ```
 
+## Offline Recall Test (SQLite)
+
+If you have access to your SiYuan SQLite database (must include table `blocks`), you can quickly test the recall pipeline without running the SiYuan HTTP API:
+
+```bash
+pnpm recall:sqlite -- --siyuan-db /path/to/siyuan.db --prompt "Rust ownership 是什么？" --force
+```
+
+Optional: build a temporary local FTS index from the same DB and include the `fts` path:
+
+```bash
+pnpm recall:sqlite -- --siyuan-db /path/to/siyuan.db --prompt "OAuth token 刷新" --build-index --paths fts,sql
+```
+
 ## Test Coverage
 
-- **109 tests passing** ✅
+- Vitest unit/integration tests (run `pnpm test`)
 - Configuration management: 14 tests
 - SiYuan API client: 13 tests
 - Routing engine: 21 tests
@@ -164,6 +178,7 @@ src/
 ├── clients/             # External integrations
 │   ├── config.js              # Configuration management
 │   ├── siyuan-client.js       # SiYuan API client
+├── infra/               # Local infrastructure (DB, etc.)
 │   └── index-manager.js       # Local SQLite FTS index
 └── index.js             # Plugin entry point
 ```
@@ -171,6 +186,7 @@ src/
 ## Documentation
 
 - [DESIGN.md](./DESIGN.md) - Complete design document with lifecycle flows and architecture details
+- [README.zh-CN.md](./README.zh-CN.md) - 中文文档
 
 ## Contributing
 

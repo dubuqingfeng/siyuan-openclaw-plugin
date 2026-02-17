@@ -602,10 +602,11 @@ export class MemoryRecall {
         .replace(/'/g, "''");
 
     const limited = this.clampKeywordCount(keywords);
-    const likeTerms = limited.map((k) => `content LIKE '%${escapeLike(k)}%' ESCAPE '\\\\'`);
+    // SQLite requires ESCAPE to be a single character; use backslash.
+    const likeTerms = limited.map((k) => `content LIKE '%${escapeLike(k)}%' ESCAPE '\\'`);
     // Fallback to querying the raw query if keyword extraction yields nothing useful.
     if (likeTerms.length === 0 && query) {
-      likeTerms.push(`content LIKE '%${escapeLike(query)}%' ESCAPE '\\\\'`);
+      likeTerms.push(`content LIKE '%${escapeLike(query)}%' ESCAPE '\\'`);
     }
 
     let whereClause = likeTerms.length ? `(${likeTerms.join(" OR ")})` : "1=0";

@@ -1,24 +1,43 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { buildConfig } from '../../src/clients/config.js';
 
 describe('configuration management', () => {
   let testConfigDir;
   let testConfigPath;
   let originalCwd;
+  let fakeHomeDir;
+  let buildConfig;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     originalCwd = process.cwd();
-    testConfigDir = join(tmpdir(), 'openclaw-test-' + Date.now());
+    testConfigDir = join(
+      tmpdir(),
+      `openclaw-test-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    );
     testConfigPath = join(testConfigDir, 'openclaw.json');
+    fakeHomeDir = join(testConfigDir, 'home');
     mkdirSync(testConfigDir, { recursive: true });
+    mkdirSync(fakeHomeDir, { recursive: true });
+
+    // Make tests hermetic: never read the developer's real ~/.openclaw files.
+    vi.resetModules();
+    vi.doMock('os', async () => {
+      const actual = await vi.importActual('os');
+      return {
+        ...actual,
+        homedir: () => fakeHomeDir,
+      };
+    });
+
+    ({ buildConfig } = await import('../../src/clients/config.js'));
   });
 
   afterEach(() => {
     // Some tests temporarily change cwd to validate default config discovery.
     process.chdir(originalCwd);
+    vi.doUnmock('os');
     if (existsSync(testConfigDir)) {
       rmSync(testConfigDir, { recursive: true, force: true });
     }
@@ -89,6 +108,27 @@ describe('configuration management', () => {
 
       expect(config.siyuan.apiUrl).toBe('http://localhost:2222');
       expect(config.siyuan.apiToken).toBe('config-token');
+    });
+
+    it('should prefer user home config over project-local config', () => {
+      // Home config should override project-local config when both exist.
+      const homeConfigPath = join(fakeHomeDir, '.openclaw', 'siyuan.config.json');
+      mkdirSync(join(fakeHomeDir, '.openclaw'), { recursive: true });
+      writeFileSync(
+        homeConfigPath,
+        JSON.stringify({ siyuan: { apiUrl: 'http://localhost:9999', apiToken: 'home-token' } }, null, 2)
+      );
+
+      process.chdir(testConfigDir);
+      writeFileSync(
+        join(testConfigDir, 'openclaw.config.json'),
+        JSON.stringify({ siyuan: { apiUrl: 'http://localhost:2222', apiToken: 'project-token' } }, null, 2)
+      );
+
+      const config = buildConfig();
+
+      expect(config.siyuan.apiUrl).toBe('http://localhost:9999');
+      expect(config.siyuan.apiToken).toBe('home-token');
     });
 
     it('should merge with default configuration', () => {

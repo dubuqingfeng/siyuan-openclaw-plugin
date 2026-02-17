@@ -1,9 +1,10 @@
 import { buildConfig } from "./src/clients/config.js";
 import { SiYuanClient } from "./src/clients/siyuan-client.js";
-import { IndexManager } from "./src/clients/index-manager.js";
+import { IndexManager } from "./src/infra/index-manager.js";
 import { MemoryRecall } from "./src/services/memory-recall.js";
 import { RoutingEngine } from "./src/services/routing-engine.js";
 import { ContentWriter } from "./src/services/content-writer.js";
+import { IndexSyncService } from "./src/services/index-sync.js";
 
 /**
  * Plugin state
@@ -12,6 +13,7 @@ let siyuanClient = null;
 let config = null;
 let siyuanAvailable = false;
 let indexManager = null;
+let indexSync = null;
 let memoryRecall = null;
 let routingEngine = null;
 let contentWriter = null;
@@ -86,17 +88,31 @@ export function register(api) {
       try {
         indexManager = new IndexManager({
           dbPath: config.index.dbPath,
+          privacyNotebook: config.index?.privacyNotebook,
+          archiveNotebook: config.index?.archiveNotebook,
+          skipNotebookNames: config.index?.skipNotebookNames,
         });
         console.log("[OpenClaw SiYuan] Local index initialized");
 
-        await performInitialSync();
-        startBackgroundSync();
+        indexSync = new IndexSyncService({ siyuanClient, indexManager, config });
+        try {
+          await indexSync.refreshNotebookCache();
+        } catch (error) {
+          console.warn(
+            "[OpenClaw SiYuan] Failed to refresh notebook cache:",
+            error?.message || String(error),
+          );
+        }
+
+        await indexSync.performInitialSync();
+        indexSync.startBackgroundSync();
       } catch (error) {
         console.error(
           "[OpenClaw SiYuan] Failed to initialize index:",
           error.message,
         );
         indexManager = null;
+        indexSync = null;
       }
     }
 
@@ -271,141 +287,6 @@ async function handleCommandNew(_event) {
     // TODO: Implement session archive logic if needed
   } catch (error) {
     console.error("[OpenClaw SiYuan] Session reset failed:", error.message);
-  }
-}
-
-/**
- * Start background sync process
- */
-function startBackgroundSync() {
-  const intervalMs = config.index?.syncIntervalMs || 5 * 60 * 1000;
-
-  setInterval(async () => {
-    try {
-      await performIncrementalSync();
-    } catch (error) {
-      console.error("[OpenClaw SiYuan] Sync failed:", error.message);
-    }
-  }, intervalMs);
-
-  console.log(
-    `[OpenClaw SiYuan] Background sync started (interval: ${intervalMs}ms)`,
-  );
-}
-
-/**
- * Perform initial full index sync
- */
-async function performInitialSync() {
-  if (!indexManager || !siyuanAvailable) {
-    return;
-  }
-
-  const lastSync = indexManager.getLastSyncTime();
-  if (lastSync) {
-    console.log(
-      "[OpenClaw SiYuan] Index already initialized, skipping full sync",
-    );
-    return;
-  }
-
-  try {
-    console.log("[OpenClaw SiYuan] Starting initial index sync...");
-
-    // Get all notebooks
-    const notebooks = await siyuanClient.listNotebooks();
-
-    let totalDocs = 0;
-
-    for (const notebook of notebooks) {
-      // Query all documents in notebook
-      const docs = await siyuanClient.query(`
-        SELECT id, content, hpath, updated
-        FROM blocks
-        WHERE type = 'd'
-        AND box = '${notebook.id}'
-        ORDER BY updated DESC
-      `);
-
-      if (docs.length > 0) {
-        const docsToSync = docs.map((doc) => ({
-          id: doc.id,
-          title: doc.content || "Untitled",
-          hpath: doc.hpath,
-          content: doc.content,
-          updated: doc.updated,
-        }));
-
-        indexManager.syncDocuments(docsToSync);
-        totalDocs += docs.length;
-      }
-    }
-
-    indexManager.updateSyncTime(new Date().toISOString());
-    console.log(
-      `[OpenClaw SiYuan] Initial sync complete: ${totalDocs} documents indexed`,
-    );
-  } catch (error) {
-    console.error("[OpenClaw SiYuan] Initial sync failed:", error.message);
-  }
-}
-
-/**
- * Perform incremental index synchronization
- */
-async function performIncrementalSync() {
-  if (!indexManager || !siyuanAvailable) {
-    return;
-  }
-
-  const lastSync = indexManager.getLastSyncTime();
-  if (!lastSync) {
-    console.log("[OpenClaw SiYuan] No previous sync, running initial sync");
-    await performInitialSync();
-    return;
-  }
-
-  const syncTime = new Date().toISOString();
-
-  try {
-    // Get updated blocks since last sync
-    const updatedBlocks = await siyuanClient.getUpdatedBlocks(lastSync);
-
-    if (updatedBlocks.length > 0) {
-      // Group blocks by document
-      const docMap = new Map();
-
-      for (const block of updatedBlocks) {
-        const docId = block.root_id || block.id;
-
-        if (!docMap.has(docId)) {
-          docMap.set(docId, {
-            id: docId,
-            title: block.content?.substring(0, 100) || "Untitled",
-            hpath: block.hpath,
-            content: block.content,
-            blocks: [],
-            updated: block.updated,
-          });
-        }
-
-        docMap.get(docId).blocks.push({
-          id: block.id,
-          content: block.content,
-        });
-      }
-
-      // Sync all updated documents
-      indexManager.syncDocuments(Array.from(docMap.values()));
-
-      console.log(
-        `[OpenClaw SiYuan] Incremental sync: ${updatedBlocks.length} blocks updated`,
-      );
-    }
-
-    indexManager.updateSyncTime(syncTime);
-  } catch (error) {
-    console.error("[OpenClaw SiYuan] Incremental sync failed:", error.message);
   }
 }
 

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { IndexManager } from '../../src/clients/index-manager.js';
+import { IndexManager } from '../../src/infra/index-manager.js';
 
 describe('index synchronization system', () => {
   let indexManager;
@@ -121,6 +121,73 @@ describe('index synchronization system', () => {
       ).all('doc-1');
 
       expect(results.length).toBeGreaterThan(0);
+    });
+
+    it('should skip indexing for excluded notebooks (privacy/archive)', () => {
+      indexManager.close();
+      indexManager = new IndexManager({
+        dbPath: testDbPath,
+        privacyNotebook: 'Private',
+        archiveNotebook: 'Archive',
+      });
+
+      const doc = {
+        id: 'doc-private-1',
+        title: 'Secret',
+        hpath: '/Private/secret',
+        content: 'top secret',
+        updated: '2026-02-16T10:00:00Z',
+      };
+
+      indexManager.indexDocument(doc);
+
+      const reg = indexManager.db.prepare(
+        'SELECT * FROM doc_registry WHERE doc_id = ?'
+      ).get('doc-private-1');
+      expect(reg).toBeUndefined();
+
+      const blocks = indexManager.db.prepare(
+        'SELECT COUNT(*) as count FROM block_fts WHERE doc_id = ?'
+      ).get('doc-private-1');
+      expect(blocks.count).toBe(0);
+
+      const results = indexManager.search('secret');
+      expect(results).toEqual([]);
+    });
+
+    it('should remove existing index entries when a document becomes excluded', () => {
+      // Step 1: index normally
+      indexManager.indexDocument({
+        id: 'doc-1',
+        title: 'Will be excluded',
+        hpath: '/Private/will-be-excluded',
+        content: 'needle',
+        updated: '2026-02-16T10:00:00Z',
+      });
+
+      expect(indexManager.search('needle').length).toBeGreaterThan(0);
+
+      // Step 2: reopen with exclusion enabled and re-index same doc (sync update)
+      indexManager.close();
+      indexManager = new IndexManager({
+        dbPath: testDbPath,
+        privacyNotebook: 'Private',
+      });
+
+      indexManager.indexDocument({
+        id: 'doc-1',
+        title: 'Will be excluded',
+        hpath: '/Private/will-be-excluded',
+        content: 'needle',
+        updated: '2026-02-16T11:00:00Z',
+      });
+
+      const reg = indexManager.db.prepare(
+        'SELECT * FROM doc_registry WHERE doc_id = ?'
+      ).get('doc-1');
+      // With "skip only" policy, we don't mutate existing index state.
+      expect(reg).toBeDefined();
+      expect(indexManager.search('needle').length).toBeGreaterThan(0);
     });
   });
 

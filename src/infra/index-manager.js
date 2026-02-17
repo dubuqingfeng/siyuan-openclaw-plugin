@@ -9,9 +9,21 @@ export class IndexManager {
   /**
    * @param {object} config - Index configuration
    * @param {string} config.dbPath - Path to SQLite database
+   * @param {string} [config.privacyNotebook] - Notebook name to exclude from indexing
+   * @param {string} [config.archiveNotebook] - Notebook name to exclude from indexing
+   * @param {string[]} [config.skipNotebookNames] - Additional notebook names to exclude from indexing
    */
   constructor(config) {
     this.dbPath = config.dbPath;
+    this.excludedNotebookNames = new Set(
+      this.normalizeNotebookNameList([
+        config.privacyNotebook,
+        config.archiveNotebook,
+        ...(Array.isArray(config.skipNotebookNames)
+          ? config.skipNotebookNames
+          : []),
+      ]),
+    );
 
     // Ensure directory exists
     const dir = dirname(this.dbPath);
@@ -24,6 +36,46 @@ export class IndexManager {
     this.db.pragma('journal_mode = WAL');
 
     this.initializeTables();
+  }
+
+  normalizeNotebookNameList(names) {
+    return (Array.isArray(names) ? names : [])
+      .map((n) => String(n || "").trim())
+      .filter(Boolean)
+      .map((n) => n.replace(/^\/+|\/+$/g, "")) // tolerate "/Notebook"
+      .filter(Boolean);
+  }
+
+  getNotebookNameFromDoc(doc) {
+    if (!doc || typeof doc !== 'object') return null;
+
+    const direct =
+      doc.notebook ||
+      doc.notebookName ||
+      doc.notebook_name ||
+      doc.boxName ||
+      doc.box_name;
+    if (typeof direct === 'string' && direct.trim()) {
+      return direct.trim().replace(/^\/+|\/+$/g, '');
+    }
+
+    const hpath = typeof doc.hpath === 'string' ? doc.hpath : '';
+    const parts = hpath
+      .split('/')
+      .map((p) => p.trim())
+      .filter(Boolean);
+
+    // In SiYuan, `hpath` is typically "/<notebook>/<path...>".
+    return parts.length > 0 ? parts[0] : null;
+  }
+
+  shouldSkipIndex(doc) {
+    if (!this.excludedNotebookNames || this.excludedNotebookNames.size === 0) {
+      return false;
+    }
+    const notebookName = this.getNotebookNameFromDoc(doc);
+    if (!notebookName) return false;
+    return this.excludedNotebookNames.has(notebookName);
   }
 
   /**
@@ -80,6 +132,13 @@ export class IndexManager {
    * @param {object} doc - Document to index
    */
   indexDocument(doc) {
+    if (doc?.id && this.shouldSkipIndex(doc)) {
+      console.log(
+        `[IndexManager] Skip indexing doc ${doc.id} (notebook: ${this.getNotebookNameFromDoc(doc) || "unknown"})`,
+      );
+      return;
+    }
+
     const transaction = this.db.transaction(() => {
       // Upsert document metadata
       this.db.prepare(`
@@ -125,6 +184,25 @@ export class IndexManager {
           }
         }
       }
+    });
+
+    transaction();
+  }
+
+  /**
+   * Remove a document from local index (best-effort cleanup if it was previously indexed).
+   * This is used for excluded notebooks where we want "no traces" in doc_registry/block_fts.
+   * @param {string} docId
+   */
+  removeFromIndex(docId) {
+    if (!docId) return;
+
+    const transaction = this.db.transaction(() => {
+      // Remove any FTS entries first.
+      this.db.prepare('DELETE FROM block_fts WHERE doc_id = ?').run(docId);
+
+      // Remove registry entry as well ("no traces" policy).
+      this.db.prepare('DELETE FROM doc_registry WHERE doc_id = ?').run(docId);
     });
 
     transaction();
