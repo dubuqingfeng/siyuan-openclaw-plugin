@@ -41,6 +41,8 @@ const DEFAULT_CONFIG = {
     enabled: true,
     minPromptLength: 10,
     maxContextTokens: 2000,
+    // Per-block excerpt truncation limit when formatting recalled docs.
+    blockExcerptMaxChars: 540,
     // Optional: cap number of recalled documents injected into context.
     // (Blocks per doc are still controlled by perDocBlockCap/finalBlockLimit in twoStage.)
     maxDocs: 5,
@@ -170,6 +172,13 @@ export function validateConfig(config) {
 
   if (config.recall && typeof config.recall.maxContextTokens !== "number") {
     errors.push("recall.maxContextTokens must be a number");
+  }
+  if (
+    config.recall &&
+    config.recall.blockExcerptMaxChars != null &&
+    typeof config.recall.blockExcerptMaxChars !== "number"
+  ) {
+    errors.push("recall.blockExcerptMaxChars must be a number or null");
   }
   if (
     config.recall &&

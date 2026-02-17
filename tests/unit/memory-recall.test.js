@@ -405,6 +405,29 @@ describe("memory recall system", () => {
       expect(grouped["doc2"].blocks).toHaveLength(1);
     });
 
+    it("should de-duplicate identical blocks within the same document", () => {
+      const blocks = [
+        {
+          id: "doc1",
+          root_id: "doc1",
+          hpath: "/个人/【简历】resume",
+          content: "简历 - 张三\nSome content here",
+          _score: 1.0,
+        },
+        {
+          id: "doc1::h2::0",
+          root_id: "doc1",
+          hpath: "/个人/【简历】resume",
+          content: "简历 - 张三\nSome content here",
+          _score: 0.5,
+        },
+      ];
+
+      const grouped = recall.groupByDocument(blocks);
+      expect(grouped["doc1"].blocks).toHaveLength(1);
+      expect(grouped["doc1"].blocks[0].id).toBe("doc1");
+    });
+
     it("should calculate document relevance score", () => {
       const doc = {
         blocks: [
@@ -500,6 +523,32 @@ describe("memory recall system", () => {
 
       expect(context).toContain("2026-02-14");
       expect(context).toContain("/项目/Rust");
+    });
+
+    it("should allow configuring per-block excerpt truncation length", () => {
+      const docs = [
+        {
+          path: "/doc1",
+          blocks: [
+            {
+              content:
+                "Title\n" +
+                "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+            },
+          ],
+          score: 0.8,
+          updated: "2026-02-14",
+        },
+      ];
+
+      const cfg = {
+        recall: { maxContextTokens: 2000, blockExcerptMaxChars: 10 },
+      };
+      const r = new MemoryRecall(mockClient, cfg);
+      const context = r.formatContext(docs);
+
+      // "rest" (after first line) should be truncated to 10 chars + "..."
+      expect(context).toContain("abcdefghij...");
     });
   });
 

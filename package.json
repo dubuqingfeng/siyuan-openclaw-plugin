@@ -8,6 +8,7 @@
     "test": "vitest",
     "test:watch": "vitest --watch",
     "test:coverage": "vitest --coverage",
+    "check": "node index.js check",
     "lint": "eslint src tests",
     "lint:fix": "eslint src tests --fix"
   },

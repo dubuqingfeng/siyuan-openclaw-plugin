@@ -1142,6 +1142,14 @@ export class MemoryRecall {
   groupByDocument(blocks) {
     const grouped = {};
 
+    const fingerprintOf = (block) => {
+      // FTS may return both doc-level entries and section-level entries with identical content.
+      // De-dup by a normalized prefix to avoid repeated bullets in the final context.
+      const raw = typeof block?.content === "string" ? block.content : "";
+      const normalized = raw.replace(/\s+/g, " ").trim();
+      return normalized.slice(0, 800);
+    };
+
     for (const block of blocks) {
       const docId = block.root_id || block.id;
 
@@ -1150,10 +1158,25 @@ export class MemoryRecall {
           docId,
           path: block.hpath,
           blocks: [],
+          _bestByFp: new Map(),
         };
       }
 
-      grouped[docId].blocks.push(block);
+      const fp = fingerprintOf(block);
+      const existing = grouped[docId]._bestByFp.get(fp);
+      const score = typeof block?._score === "number" ? block._score : 0;
+      const existingScore =
+        typeof existing?._score === "number" ? existing._score : 0;
+      if (!existing || score > existingScore) {
+        grouped[docId]._bestByFp.set(fp, block);
+      }
+    }
+
+    // Materialize de-duped blocks.
+    for (const docId of Object.keys(grouped)) {
+      const doc = grouped[docId];
+      doc.blocks = [...doc._bestByFp.values()];
+      delete doc._bestByFp;
     }
 
     return grouped;
@@ -1387,6 +1410,13 @@ export class MemoryRecall {
       .sort((a, b) => (b?._score ?? 0) - (a?._score ?? 0))
       .slice(0, 5);
 
+    const excerptMaxCharsRaw = this.config?.recall?.blockExcerptMaxChars;
+    const excerptMaxChars =
+      Number.isFinite(Number(excerptMaxCharsRaw)) &&
+      Number(excerptMaxCharsRaw) > 0
+        ? Number(excerptMaxCharsRaw)
+        : 540;
+
     for (const block of topBlocks) {
       const content = (
         typeof block.content === "string" ? block.content : ""
@@ -1400,7 +1430,10 @@ export class MemoryRecall {
         const headingMatch = first.match(/^(#{1,6})\s+(.*)$/);
         const title = headingMatch ? headingMatch[2] : first;
         const rest = lines.slice(1).join(" ");
-        const excerpt = rest.length > 240 ? rest.slice(0, 240) + "..." : rest;
+        const excerpt =
+          rest.length > excerptMaxChars
+            ? rest.slice(0, excerptMaxChars) + "..."
+            : rest;
 
         section += `- ${title}\n`;
         if (excerpt) section += `  ${excerpt}\n`;

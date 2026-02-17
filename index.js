@@ -5,6 +5,8 @@ import { MemoryRecall } from "./src/services/memory-recall.js";
 import { RoutingEngine } from "./src/services/routing-engine.js";
 import { ContentWriter } from "./src/services/content-writer.js";
 import { IndexSyncService } from "./src/services/index-sync.js";
+import { fileURLToPath } from "url";
+import path from "path";
 
 function deepMerge(target, source) {
   const t = target && typeof target === "object" ? target : {};
@@ -362,4 +364,201 @@ export function getStatus() {
   }
 
   return status;
+}
+
+/**
+ * CLI helper: given a prompt, return recalled context (same as before_agent_start).
+ *
+ * This is intentionally kept independent from plugin state so it can be used for local testing:
+ *   node index.js check --prompt "..." [--offline] [--json] [--config path]
+ */
+export async function check({
+  prompt,
+  configPath,
+  offline = false,
+  verbose = false,
+} = {}) {
+  const text = typeof prompt === "string" ? prompt : "";
+  if (!text.trim()) {
+    throw new Error("Missing --prompt");
+  }
+
+  const originalConsole = {
+    log: console.log,
+    info: console.info,
+    warn: console.warn,
+    error: console.error,
+  };
+  if (!verbose) {
+    console.log = () => {};
+    console.info = () => {};
+    console.warn = () => {};
+    console.error = () => {};
+  }
+
+  try {
+    const cfg = buildConfig(configPath);
+
+    // Build local index if enabled so we can run in offline/degraded mode.
+    let localIndexManager = null;
+    if (cfg.index?.enabled) {
+      try {
+        localIndexManager = new IndexManager({
+          dbPath: cfg.index.dbPath,
+          privacyNotebook: cfg.index?.privacyNotebook,
+          archiveNotebook: cfg.index?.archiveNotebook,
+          skipNotebookNames: cfg.index?.skipNotebookNames,
+        });
+      } catch (error) {
+        localIndexManager = null;
+        // Keep going; SiYuan-only search may still work.
+        if (verbose) {
+          originalConsole.warn(
+            "[OpenClaw SiYuan][check] Failed to init local index:",
+            error?.message || String(error),
+          );
+        }
+      }
+    }
+
+    const client = new SiYuanClient(cfg.siyuan);
+
+    // If SiYuan is down, the recall system will still work with local FTS (if available).
+    // For explicit offline mode, avoid touching SiYuan APIs entirely.
+    if (offline) {
+      cfg.recall = { ...(cfg.recall || {}), searchPaths: ["fts"] };
+      cfg.linkedDoc = { ...(cfg.linkedDoc || {}), enabled: false };
+    } else {
+      try {
+        const health = await client.healthCheck();
+        if (!health.available) {
+          // Fall back to local-only search to reduce noisy failures.
+          cfg.recall = { ...(cfg.recall || {}), searchPaths: ["fts"] };
+          cfg.linkedDoc = { ...(cfg.linkedDoc || {}), enabled: false };
+        }
+      } catch {
+        cfg.recall = { ...(cfg.recall || {}), searchPaths: ["fts"] };
+        cfg.linkedDoc = { ...(cfg.linkedDoc || {}), enabled: false };
+      }
+    }
+
+    const recall = new MemoryRecall(client, cfg, localIndexManager);
+    return await recall.recall(text);
+  } finally {
+    console.log = originalConsole.log;
+    console.info = originalConsole.info;
+    console.warn = originalConsole.warn;
+    console.error = originalConsole.error;
+  }
+}
+
+function isMainModule() {
+  try {
+    const thisFile = fileURLToPath(import.meta.url);
+    const entry = process.argv[1]
+      ? path.resolve(process.argv[1])
+      : thisFile;
+    return path.resolve(thisFile) === entry;
+  } catch {
+    return false;
+  }
+}
+
+function parseCheckArgs(argv) {
+  const out = {
+    prompt: "",
+    configPath: undefined,
+    json: false,
+    offline: false,
+    verbose: false,
+    help: false,
+  };
+
+  const positionals = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--prompt" || a === "-p") {
+      out.prompt = String(argv[i + 1] ?? "");
+      i++;
+      continue;
+    }
+    if (a === "--config" || a === "-c") {
+      out.configPath = String(argv[i + 1] ?? "");
+      i++;
+      continue;
+    }
+    if (a === "--json") {
+      out.json = true;
+      continue;
+    }
+    if (a === "--offline") {
+      out.offline = true;
+      continue;
+    }
+    if (a === "--verbose" || a === "-v") {
+      out.verbose = true;
+      continue;
+    }
+    if (a === "--help" || a === "-h") {
+      out.help = true;
+      continue;
+    }
+    positionals.push(a);
+  }
+
+  if (!out.prompt && positionals.length > 0) {
+    out.prompt = positionals.join(" ");
+  }
+
+  return out;
+}
+
+function printCheckHelp() {
+  // Keep this minimal; this file is also used as a plugin entry.
+  process.stdout.write(`Usage:
+  node index.js check --prompt "..." [--offline] [--json] [--config path] [--verbose]
+
+Options:
+  -p, --prompt   Prompt text (or provide as positional args)
+  -c, --config   Config file path (default follows buildConfig() resolution)
+      --offline  Force local-only recall (FTS) and disable linkedDoc fetch
+      --json     Print full JSON result instead of only prependContext
+  -v, --verbose  Show logs (default: quiet)
+`);
+}
+
+if (isMainModule()) {
+  const [cmd, ...rest] = process.argv.slice(2);
+  if (cmd === "check") {
+    const args = parseCheckArgs(rest);
+    if (args.help) {
+      printCheckHelp();
+      process.exit(0);
+    }
+    check({
+      prompt: args.prompt,
+      configPath: args.configPath,
+      offline: args.offline,
+      verbose: args.verbose,
+    })
+      .then((result) => {
+        if (args.json) {
+          process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+          return;
+        }
+        const ctx = String(result?.prependContext || "");
+        process.stdout.write(ctx + "\n");
+        if (!ctx.trim() && result?.error) {
+          process.stderr.write(String(result.error) + "\n");
+          process.exitCode = 2;
+        }
+      })
+      .catch((err) => {
+        process.stderr.write(String(err?.message || err) + "\n");
+        process.exit(1);
+      });
+  } else if (cmd && (cmd === "-h" || cmd === "--help")) {
+    printCheckHelp();
+    process.exit(0);
+  }
 }
